@@ -6,8 +6,10 @@ from __future__ import print_function
 
 import argparse
 import json
+import logging
 import sys
 
+from ..compliance_checker.mlp_compliance import usage_choices, rule_choices
 
 def _get_or_default(json, field, default):
     if field in json:
@@ -16,11 +18,12 @@ def _get_or_default(json, field, default):
         return default
 
 
-def check_training_system_desc(json_file, ruleset):
+def check_system_desc(json_file, usage, ruleset):
     """Checks a training system desc json file for validity.
 
     Args:
         json_file: The system desc json file to check.
+        usage: The usage such as training, inference_edge, inference_server, hpc.
         ruleset: The ruleset such as 0.6.0, 0.7.0, or 1.0.0.
 
     Returns:
@@ -91,7 +94,32 @@ def check_training_system_desc(json_file, ruleset):
         _get_or_default(contents, "framework", ""),
     ]) + ","
 
-    ruleset_prefix = "https://github.com/mlperf/training_results_v{}".format(ruleset)
+    # Check availability
+    if usage == "training":
+        availability_options = [
+            "Available on-premise", 
+            "available on-premise",
+            "onprem",
+            "available",
+            "Available onprem",
+            "available onprem",
+            "Available cloud",
+            "available cloud",
+            "cloud",
+            "Research, Development, or Internal (RDI)",
+            "research, development, or internal (rdi)",
+            "rdi",
+            "research",
+            "development",
+            "internal",
+            "preview"
+        ]
+        if ("status" in contents) and (contents["status"] not in availability_options) and (contents["status"].lower() not in availability_options):
+            valid = False
+            invalid_reasons = ["Field status contains a non valid value: {}, must be one of {}".format(contents["status"], availability_options)]
+
+
+    ruleset_prefix = "https://github.com/mlperf/{}_results_v{}".format(usage, ruleset)
     if "submitter" in contents and "system_name" in contents:
         details_link = "{ruleset_prefix}/blob/master/{submitter}/systems/{system_name}.json".format(
             ruleset_prefix=ruleset_prefix,
@@ -112,12 +140,9 @@ def check_training_system_desc(json_file, ruleset):
     ])
 
     if not valid:
-        print("FAILURE: {}".format(", ".join(invalid_reasons)))
+        logging.error('  System description checker failed for %s : %s', system_name, invalid_reasons)
     else:
-        print("SUCCESS")
-
-    print("Table CSV prefix: {}".format(table_csv_prefix))
-    print("Table CSV postfix: {}".format(table_csv_postfix))
+        logging.info('  System description checker passed for %s', system_name)
 
     return valid, system_name, table_csv_prefix, table_csv_postfix
 
@@ -130,15 +155,16 @@ def get_parser():
 
     parser.add_argument('filename', type=str,
                     help='the file to check for compliance')
-    parser.add_argument('usage', type=str,
-                    help='the usage such as training, inference_edge, inference_server')
-    parser.add_argument('ruleset', type=str,
+    parser.add_argument('usage', type=str, choices=usage_choices(),
+                    help='the usage such as training, inference_edge, inference_server, hpc')
+    parser.add_argument('ruleset', type=str, choices=rule_choices(),
                     help='the ruleset such as 0.6.0, 0.7.0, or 1.0.0')
     parser.add_argument('--werror', action='store_true',
                     help='Treat warnings as errors')
     parser.add_argument('--quiet', action='store_true',
                     help='Suppress warnings. Does nothing if --werror is set')
-
+    parser.add_argument('--log_output', type=str, default='system_desc_checker.log',
+                    help='where to store system description checker output log')
     return parser
 
 
@@ -146,14 +172,14 @@ def main():
     parser = get_parser()
     args = parser.parse_args()
 
-    if args.usage != 'training':
-        print('Usage {} is not supported.'.format(args.usage))
-        sys.exit(1)
-    if args.ruleset not in ['0.6.0', '0.7.0', '1.0.0']:
-        print('Ruleset {} is not supported.'.format(args.ruleset))
-        sys.exit(1)
+    logging.basicConfig(filename=args.log_output, level=logging.INFO)
+    logging.getLogger().addHandler(logging.StreamHandler())
+    formatter = logging.Formatter("%(levelname)s - %(message)s")
+    logging.getLogger().handlers[0].setFormatter(formatter)
+    logging.getLogger().handlers[1].setFormatter(formatter)
 
-    check_training_system_desc(args.filename, args.ruleset)
+    check_system_desc(args.filename, args.usage, args.ruleset)
+    print('** Logging output also at', args.log_output)
 
 
 if __name__ == '__main__':

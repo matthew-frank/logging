@@ -8,6 +8,7 @@ import argparse
 import os
 import yaml
 import json
+import logging
 import re
 import math
 
@@ -18,7 +19,7 @@ def is_integer(value):
     return abs(round(value) - value) < 0.00001
 
 
-class CCError(Exception): 
+class CCError(Exception):
     pass
 
 
@@ -41,7 +42,8 @@ def merge(*dicts,):
 
 class ComplianceChecker:
 
-    def __init__(self, ruleset, quiet, werror):
+    def __init__(self, usage, ruleset, quiet, werror):
+        self.usage = usage
         self.ruleset = ruleset
 
         self.warnings = {}
@@ -59,7 +61,6 @@ class ComplianceChecker:
         if self.werror:
             self.put_message(msg, key)
         elif not self.quiet:
-            print(key, msg)
             self.warnings[key] = msg
 
     def put_message(self, msg, key=None):
@@ -82,7 +83,7 @@ class ComplianceChecker:
                     *self.not_overwritable
         ])
         if message:
-          print(message)
+            logging.warning(" %s", message)
 
     def has_messages(self):
         return self.not_overwritable or self.overwritable
@@ -120,10 +121,10 @@ class ComplianceChecker:
         for test in tests:
             try:
                 if not eval(test.strip(), state):
-                    self.put_message(
-                        f"failed test: {test}"
-                        f"\ncurrent context[s]={preety_dict(state['s'])}",
-                    )
+                   self.put_message(
+                       f"failed test: {test}"
+                       f"\ncurrent context[s]={preety_dict(state['s'])}",
+                   )
             except:
                 self.put_message(
                     f'Failed executing CHECK code:'
@@ -146,6 +147,11 @@ class ComplianceChecker:
         alternatives = in_pharentises.split(',')
         return [s.strip() for s in alternatives]
 
+    def parse_at_least(self, string):
+        n_string = string[len('AT_LEAST(') : -1]
+        n = int(n_string)
+        return n
+
     def configured_checks(self, loglines, config_file):
         with open(config_file) as f:
             checks = yaml.load(f, Loader=yaml.BaseLoader)
@@ -163,12 +169,12 @@ class ComplianceChecker:
         begin_blocks = [x for x in checks if list(x)[0]=='BEGIN']
         assert(len(begin_blocks)<=1) # up to one begin block
         if len(begin_blocks)==1:
-            exec(begin_blocks[0]['BEGIN']['CODE'].strip(), state)
+            exec(begin_blocks[0]['BEGIN']['CODE'].strip(), state, locals())
 
         key_records = {}
         for k in checks:
             if list(k)[0]=='KEY':
-                key_records.update({k['KEY']['NAME']:k['KEY']}) 
+                key_records.update({k['KEY']['NAME']:k['KEY']})
 
         reported_values = {k:[] for k in key_records.keys()}
 
@@ -177,6 +183,7 @@ class ComplianceChecker:
 
         at_least_one_checks = {}
         # executing the rules through log records
+        has_been_exec = set([])
         for line in loglines:
             key_record = None
             try:
@@ -185,10 +192,10 @@ class ComplianceChecker:
             except:
                 # unknown key - it's allowed, skip to next record
                 continue
-
-            if 'PRE' in key_record: self.run_check_exec(line, key_record['PRE'], state, 'PRE')
-            if 'CHECK' in key_record: self.run_check_eval(line, key_record['CHECK'], state)
-            if 'POST' in key_record: self.run_check_exec(line, key_record['POST'], state, 'POST')
+            if line.key not in has_been_exec:
+                if 'PRE' in key_record: self.run_check_exec(line, key_record['PRE'], state, 'PRE')
+                if 'CHECK' in key_record: self.run_check_eval(line, key_record['CHECK'], state)
+                if 'POST' in key_record: self.run_check_exec(line, key_record['POST'], state, 'POST')
             if 'ATLEAST_ONE_CHECK' in key_record:
               if line.key not in at_least_one_checks:
                 at_least_one_checks[line.key] = [0, key_record['ATLEAST_ONE_CHECK']]
@@ -196,6 +203,8 @@ class ComplianceChecker:
                            state, {'ll': line, 'v': line.value})
               if check:
                 at_least_one_checks[line.key][0] += 1
+            if "submission_" in line.key and line.key not in has_been_exec:
+                has_been_exec.add(line.key)
         for name in at_least_one_checks:
           if at_least_one_checks[name][0] == 0:
             self.put_message('Failed checks for {} : {}'
@@ -224,8 +233,14 @@ class ComplianceChecker:
 
             if v['REQ']=='AT_LEAST_ONE':
                 if len(reported_values[k])<1:
-                     self.put_message(f"Required AT_LEAST_ONE occurrence of '{k}' but found {len(reported_values[k])}",
-                                      key=k)
+                    self.put_message(f"Required AT_LEAST_ONE occurrence of '{k}' but found {len(reported_values[k])}",
+                                     key=k)
+
+            if v['REQ'].startswith('AT_LEAST('):
+                n = self.parse_at_least(v['REQ'])
+                if len(reported_values[k])<n:
+                    self.put_message(f"Required AT_LEAST({n}) occurrence of '{k}' but found {len(reported_values[k])}",
+                                     key=k)
 
             if v['REQ'].startswith('AT_LEAST_ONE_OR'):
                 alternatives.add(tuple({k, *self.parse_alternatives(v['REQ'])}))
@@ -248,12 +263,13 @@ class ComplianceChecker:
           self.put_message('No log lines detected')
 
         enqueue_config(config)
-
+        
         current_dir = os.path.dirname(os.path.abspath(__file__))
         while len(enqueued_configs)>0:
             current_config = enqueued_configs.pop(0)
+            logging.info (' Compliance checks: %s', current_config)
             config_file = general_file = os.path.join(current_dir, current_config)
-
+            
             if not os.path.exists(config_file):
                 self.put_message('Could not find config file: {}'.format(config_file))
 
@@ -263,14 +279,14 @@ class ComplianceChecker:
 
     def check_file(self, filename, config_file):
 
+        logging.info('Running compliance on file: %s', filename)
         loglines, errors = mlp_parser.parse_file(filename, ruleset=self.ruleset)
 
         if len(errors) > 0:
-            print('Found parsing errors:')
+            logging.warning(' Found parsing errors:')
             for line, error in errors:
-                print(line)
-                print('  ^^ ', error)
-            print()
+                logging.warning('  %s',line)
+                logging.warning('   ^^  %s', error)
             self.put_message('Log lines had parsing errors.')
 
         self.check_loglines(loglines, config_file)
@@ -279,10 +295,13 @@ class ComplianceChecker:
 
         return not self.has_messages()
 
+def usage_choices():
+    return set(( x.split("_")[0] for x in os.listdir(os.path.dirname(__file__))
+             if re.match('\w+_\d+\.\d+\.\d+', x) ))
 
 def rule_choices():
-    return [ x for x in os.listdir(os.path.dirname(__file__))
-            if re.match('\d+\.\d+\.\d+', x) ]
+    return set(( x.split("_")[1] for x in os.listdir(os.path.dirname(__file__))
+            if re.match('\w+_\d+\.\d+\.\d+', x) ))
 
 
 def get_parser():
@@ -293,21 +312,26 @@ def get_parser():
 
     parser.add_argument('filename', type=str,
                     help='the file to check for compliance')
-    parser.add_argument('--ruleset', type=str, default='1.0.0',
+    parser.add_argument('--usage', type=str, default='training',
+                    choices=usage_choices(),
+                    help='what WG do the benchmarks come from')
+    parser.add_argument('--ruleset', type=str, default='3.1.0',
                     choices=rule_choices(),
                     help='what version of rules to check the log against')
     parser.add_argument('--config',  type=str,
-                    help='mlperf logging config, by default it loads {ruleset}/common.yaml', default=None)
+                    help='mlperf logging config, by default it loads {usage}_{ruleset}/common.yaml', default=None)
     parser.add_argument('--werror', action='store_true',
-                    help='Treas warnings as errors')
+                    help='Treat warnings as errors')
     parser.add_argument('--quiet', action='store_true',
                     help='Suppress warnings. Does nothing if --werror is set')
-
+    parser.add_argument('--log_output', type=str, default='compliance_checker.log',
+                    help='where to store compliance checker output log')
     return parser
 
 
-def make_checker(ruleset, quiet, werror):
+def make_checker(usage, ruleset, quiet, werror):
     return ComplianceChecker(
+        usage,
         ruleset,
         quiet,
         werror,
